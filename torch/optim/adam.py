@@ -142,7 +142,7 @@ class Adam(Optimizer):
                     max_exp_avg_sq  = state['max_exp_avg_sq']
                 beta1, beta2        = group['betas']
 
-                state['step'] += 1
+                state['step']      += 1
 
                 if group['weight_decay'] != 0:
                     grad = grad.add(group['weight_decay'], p.data)
