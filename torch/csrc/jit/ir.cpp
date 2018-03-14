@@ -1,11 +1,9 @@
+#ifndef NO_PYTHON
 #include <Python.h>
+#endif
 #include "ir.h"
 
-#include "torch/csrc/utils/auto_gil.h"
-#include "torch/csrc/utils/python_strings.h"
 #include "torch/csrc/autograd/function.h"
-
-#include "pybind11/pybind11.h"
 
 #include <iostream>
 #include <unordered_map>
@@ -16,11 +14,14 @@
 #include <algorithm>
 #include <string>
 
+#ifndef NO_PYTHON
+#include "torch/csrc/utils/auto_gil.h"
+#include "torch/csrc/utils/python_strings.h"
+#include "pybind11/pybind11.h"
+
 namespace py = pybind11;
 
 namespace torch { namespace jit {
-
-constexpr int max_tensor_display_size = 10;
 
 std::string getPythonName(const PyObject* obj, bool is_legacy) {
   AutoGIL gil;
@@ -34,26 +35,7 @@ std::string getPythonName(const PyObject* obj, bool is_legacy) {
     return THPUtils_unpackString(name.get());
   }
 }
-void printValueRef(std::ostream & out, const Value * n) {
-  out << "%" << n->uniqueName();
-}
 
-template <typename T>
-std::ostream& operator<<(std::ostream & out, const std::vector<T> & nodes) {
-  out << at::ArrayRef<T>{nodes};
-  return out;
-}
-
-template <typename T>
-std::ostream& operator<<(std::ostream & out, const at::ArrayRef<T> & nodes) {
-  size_t i = 0;
-  for(auto n : nodes) {
-    if(i++ > 0)
-      out << ", ";
-    printValueRef(out, n);
-  }
-  return out;
-}
 std::ostream& printPyObject(std::ostream & out, const THPObjectPtr& obj) {
   AutoGIL gil;
   auto pyobj = py::handle(const_cast<PyObject*>(obj.get()));
@@ -97,6 +79,67 @@ std::string PythonOp::name() const {
   return getPythonName(pyobj.get(),is_legacy);
 }
 
+void PythonOp::cloneFrom(Node * other_) {
+  Node::cloneFrom(other_);
+  auto other = other_->cast<PythonOp>();
+  this->cconv = other->cconv;
+  this->is_legacy = other->is_legacy;
+  Py_INCREF(other->pyobj.get());
+  this->pyobj = THPObjectPtr(other->pyobj.get());
+  this->var_flags = other->var_flags;
+  for(auto & sa : other->scalar_args) {
+    Py_INCREF(sa.get());
+    this->scalar_args.emplace_back(sa.get());
+  }
+  this->tracing_autograd_python_function =
+      other->tracing_autograd_python_function;
+}
+
+}} // namespace torch::jit
+
+#else
+
+namespace torch { namespace jit {
+
+std::ostream& printPyObject(std::ostream & out, const THPObjectPtr& obj) {
+  throw std::runtime_error("Trying to print Python object from a C++ build");
+}
+
+std::string PythonOp::name() const {
+  throw std::runtime_error("Trying to call PythonOp::name from a C++ build");
+  return std::string();
+}
+
+}} // namespace torch::jit
+
+#endif
+
+
+namespace torch { namespace jit {
+
+constexpr int max_tensor_display_size = 10;
+
+void printValueRef(std::ostream & out, const Value * n) {
+  out << "%" << n->uniqueName();
+}
+
+template <typename T>
+std::ostream& operator<<(std::ostream & out, const std::vector<T> & nodes) {
+  out << at::ArrayRef<T>{nodes};
+  return out;
+}
+
+template <typename T>
+std::ostream& operator<<(std::ostream & out, const at::ArrayRef<T> & nodes) {
+  size_t i = 0;
+  for(auto n : nodes) {
+    if(i++ > 0)
+      out << ", ";
+    printValueRef(out, n);
+  }
+  return out;
+}
+
 std::string CppOp::name() const {
   return fn->name();
 }
@@ -125,10 +168,7 @@ std::ostream& operator<<(std::ostream & out, const_value_list_with_types l) {
     }
     printValueRef(out, n);
     out << " : ";
-    if(n->hasType())
-      out << *n->type();
-    else
-      out << "UNKNOWN_TYPE";
+    out << *n->type();
   }
   return out;
 }
@@ -305,14 +345,12 @@ static void checkSameDevice(const Node* node) {
   bool has_device = false;
   int device;
   auto checkValue = [&](const Value* v) {
-    if(v->hasType()) {
-      if(TensorType* type = v->type()->cast<TensorType>()) {
-        if(!has_device) {
-          has_device = true;
-          device = type->device();
-        } else {
-          JIT_ASSERT(device == type->device());
-        }
+    if(TensorType* type = v->type()->cast<TensorType>()) {
+      if(!has_device) {
+        has_device = true;
+        device = type->device();
+      } else {
+        JIT_ASSERT(device == type->device());
       }
     }
   };
@@ -355,7 +393,7 @@ void Node::lint() const {
       JIT_ASSERT(graph_->all_nodes.count(this) == 1);
       // Handle invariant
       if (i != inputs_.size() - 1) {
-        JIT_ASSERT(!input->hasType() || input->type()->kind() != TypeKind::HandleType);
+        JIT_ASSERT(input->type()->kind() != TypeKind::HandleType);
       }
       i++;
     }
@@ -560,21 +598,6 @@ void LintGraph(std::shared_ptr<Graph>& graph) {
   graph->lint();
 }
 
-
-void PythonOp::cloneFrom(Node * other_) {
-  Node::cloneFrom(other_);
-  auto other = other_->cast<PythonOp>();
-  this->cconv = other->cconv;
-  this->is_legacy = other->is_legacy;
-  Py_INCREF(other->pyobj.get());
-  this->pyobj = THPObjectPtr(other->pyobj.get());
-  this->var_flags = other->var_flags;
-  for(auto & sa : other->scalar_args) {
-    Py_INCREF(sa.get());
-    this->scalar_args.emplace_back(sa.get());
-  }
-}
-
 void Block::cloneFrom(Block * src, std::function<Value*(Value*)> outer_map) {
   std::unordered_map<Value*, Value*> local_map;
   auto env = [&](Value * v) {
@@ -583,15 +606,22 @@ void Block::cloneFrom(Block * src, std::function<Value*(Value*)> outer_map) {
       return it->second;
     return outer_map(v);
   };
-  for(auto input : src->inputs()) {
-    local_map[input] = this->addInput()->copyMetadata(input);
-  }
+
   auto graph = owningGraph();
+  for(auto input : src->inputs()) {
+    local_map[input] = this->addInput()->copyMetadata(input)->setStage(input->stage());
+    graph->setStage(std::max(graph->stage(), input->stage()));
+  }
   for(auto node : src->nodes()) {
     auto new_node = this->appendNode(graph->createClone(node, env));
+    new_node->setStage(node->stage());
+    graph->setStage(std::max(graph->stage(), node->stage()));
     for(size_t i = 0; i < node->outputs().size(); ++i) {
-      local_map[node->outputs()[i]] = new_node->outputs()[i];
-      new_node->outputs()[i]->copyMetadata(node->outputs()[i]);
+      auto oo = node->outputs()[i];
+      auto no = new_node->outputs()[i];
+      local_map[oo] = no;
+      no->copyMetadata(oo);
+      no->setStage(oo->stage());
     }
   }
   for(auto output : src->outputs()) {
@@ -608,4 +638,4 @@ std::shared_ptr<Graph> Graph::copy() {
   return new_g;
 }
 
-}}
+}} // namespace torch::jit

@@ -1,4 +1,6 @@
+#ifndef NO_PYTHON
 #include <Python.h>
+#endif
 #include "torch/csrc/jit/fusion_compiler.h"
 #include "torch/csrc/jit/code_template.h"
 #include "torch/csrc/jit/ir.h"
@@ -15,16 +17,23 @@
 #include "torch/csrc/jit/passes/dead_code_elimination.h"
 
 #include "torch/csrc/assertions.h"
-#include "torch/csrc/utils/auto_gil.h"
 
 #include "torch/csrc/autograd/variable.h"
-#include "torch/csrc/autograd/python_engine.h"
+#include "torch/csrc/autograd/engine.h"
 #include "torch/csrc/jit/passes/shape_analysis.h"
 
 #include "torch/csrc/jit/graph_executor.h"
+#include "torch/csrc/jit/script/compiler.h"
+#include "torch/csrc/jit/script/module.h"
 
 #include <vector>
 #include <iostream>
+
+#ifndef NO_PYTHON
+#include "torch/csrc/utils/auto_gil.h"
+#else
+struct AutoNoGIL {};
+#endif
 
 namespace torch { namespace jit {
 
@@ -112,9 +121,9 @@ static void fusionTests() {
     Var i1 = Var::asNewInput(graph);
     auto o0 = i0 * i1;
     o0.addAsOutput();
-    auto a = at::CUDA(at::kFloat).rand({3,4});
-    auto b = at::CUDA(at::kFloat).rand({4,3}).transpose(0,1);
-    auto o = at::CUDA(at::kFloat).zeros({3,4});
+    auto a = at::rand(at::CUDA(at::kFloat), {3,4});
+    auto b = at::rand(at::CUDA(at::kFloat), {4,3}).transpose(0,1);
+    auto o = at::zeros(at::CUDA(at::kFloat), {3,4});
     comp.debugLaunchGraph(graph, 0, {a,b}, {o});
     auto o2 = a*b;
     float max_diff = (o2 - o).abs().max().toCDouble();
@@ -156,12 +165,12 @@ static void fusionTests() {
     for(size_t i = 0; i < graph.inputs().size(); i++) {
       std::vector<int64_t> dims = {128, 128, 32};
       std::swap(dims[ti],dims[tj]);
-      inputs.push_back(at::CUDA(at::kFloat).rand(dims).transpose(ti, tj));
+      inputs.push_back(at::rand(at::CUDA(at::kFloat), dims).transpose(ti, tj));
     }
     for(size_t i = 0; i < graph.outputs().size(); i++) {
       std::vector<int64_t> dims = {128, 128, 32};
       std::swap(dims[toi],dims[toj]);
-      outputs.push_back(at::CUDA(at::kFloat).zeros(dims).transpose(toi,toj));
+      outputs.push_back(at::zeros(at::CUDA(at::kFloat), dims).transpose(toi,toj));
     }
 
     auto t22 = inputs[4].sigmoid();
@@ -201,13 +210,13 @@ static void fusionTests() {
     o0.addAsOutput();
     Var::cat({i0, o0}, dim).addAsOutput();
 
-    auto a = at::CUDA(at::kFloat).rand({3,4,5});
-    auto b = at::CUDA(at::kFloat).rand({4,3,5}).transpose(0,1);
-    auto o = at::CUDA(at::kFloat).zeros({3,4,5});
+    auto a = at::rand(at::CUDA(at::kFloat), {3,4,5});
+    auto b = at::rand(at::CUDA(at::kFloat), {4,3,5}).transpose(0,1);
+    auto o = at::zeros(at::CUDA(at::kFloat), {3,4,5});
 
     auto o_r = a*b;
     auto o2_r = at::cat({a, o_r}, dim);
-    auto o2 = at::CUDA(at::kFloat).zeros(o2_r.sizes());
+    auto o2 = at::zeros(at::CUDA(at::kFloat), o2_r.sizes());
     comp.debugLaunchGraph(graph, 0, {a,b}, {o, o2});
 
     float max_diff = (o_r - o).abs().max().toCDouble();
@@ -387,6 +396,10 @@ std::shared_ptr<Graph> build_lstm_stages() {
   return r;
 }
 
+void runOneStage(InterpreterState & interp, const std::vector<at::Tensor> & inputs, std::vector<at::Tensor> & outputs) {
+  outputs = inputs;
+  interp.runOneStage(outputs);
+}
 
 void interpTest() {
     constexpr int batch_size = 4;
@@ -395,17 +408,17 @@ void interpTest() {
 
     int hidden_size = 2*input_size;
 
-    auto input = at::CUDA(at::kFloat).randn({seq_len, batch_size, input_size});
-    auto hx    = at::CUDA(at::kFloat).randn({batch_size, hidden_size});
-    auto cx    = at::CUDA(at::kFloat).randn({batch_size, hidden_size});
-    auto w_ih  = t_def(at::CUDA(at::kFloat).randn({4 * hidden_size, input_size}));
-    auto w_hh  = t_def(at::CUDA(at::kFloat).randn({4 * hidden_size, hidden_size}));
+    auto input = at::randn(at::CUDA(at::kFloat), {seq_len, batch_size, input_size});
+    auto hx    = at::randn(at::CUDA(at::kFloat), {batch_size, hidden_size});
+    auto cx    = at::randn(at::CUDA(at::kFloat), {batch_size, hidden_size});
+    auto w_ih  = t_def(at::randn(at::CUDA(at::kFloat), {4 * hidden_size, input_size}));
+    auto w_hh  = t_def(at::randn(at::CUDA(at::kFloat), {4 * hidden_size, hidden_size}));
 
     auto lstm_g = build_lstm();
-    Code  lstm_function(lstm_g);
+    Code lstm_function(lstm_g, /*values_are_variables=*/false);
     std::vector<at::Tensor> outputs;
     InterpreterState lstm_interp(lstm_function);
-    lstm_interp.runOneStage({input[0], hx, cx, w_ih, w_hh}, outputs);
+    runOneStage(lstm_interp, {input[0], hx, cx, w_ih, w_hh}, outputs);
     std::tie(hx, cx) = lstm(input[0], hx, cx, w_ih, w_hh);
 
     //std::cout << almostEqual(outputs[0],hx) << "\n";
@@ -419,21 +432,21 @@ void interpStageTest() {
     constexpr int seq_len = 32;
 
     int hidden_size = 2*input_size;
-    auto input = at::CUDA(at::kFloat).randn({seq_len, batch_size, input_size});
-    auto hx    = at::CUDA(at::kFloat).randn({batch_size, hidden_size});
-    auto cx    = at::CUDA(at::kFloat).randn({batch_size, hidden_size});
-    auto cx1 = at::CUDA(at::kFloat).randn({batch_size, hidden_size});
-    auto w_ih  = t_def(at::CUDA(at::kFloat).randn({4 * hidden_size, input_size}));
-    auto w_hh  = t_def(at::CUDA(at::kFloat).randn({4 * hidden_size, hidden_size}));
+    auto input = at::randn(at::CUDA(at::kFloat), {seq_len, batch_size, input_size});
+    auto hx    = at::randn(at::CUDA(at::kFloat), {batch_size, hidden_size});
+    auto cx    = at::randn(at::CUDA(at::kFloat), {batch_size, hidden_size});
+    auto cx1 = at::randn(at::CUDA(at::kFloat), {batch_size, hidden_size});
+    auto w_ih  = t_def(at::randn(at::CUDA(at::kFloat), {4 * hidden_size, input_size}));
+    auto w_hh  = t_def(at::randn(at::CUDA(at::kFloat), {4 * hidden_size, hidden_size}));
 
 
     auto lstm_g = build_lstm_stages();
-    Code lstm_function(lstm_g);
+    Code lstm_function(lstm_g, /*values_are_variables=*/false);
     std::vector<at::Tensor> outputs;
     InterpreterState lstm_interp(lstm_function);
-    lstm_interp.runOneStage({input[0], hx, cx, w_ih, w_hh}, outputs);
+    runOneStage(lstm_interp, {input[0], hx, cx, w_ih, w_hh}, outputs);
     auto cy0 = outputs[0];
-    lstm_interp.runOneStage({cx1}, outputs);
+    runOneStage(lstm_interp, {cx1}, outputs);
     at::Tensor ihx = outputs[0];
     at::Tensor icx = outputs[1];
 
@@ -490,7 +503,7 @@ std::shared_ptr<Graph> trace(const ADTestSpec& test, const variable_list& vars_i
 
 variable_list grad(const variable_list& outputs, const variable_list& inputs, const variable_list& grad_outputs) {
   static const auto get_edge = [](const Variable& v) { return v.gradient_edge(); };
-  auto & engine = torch::autograd::python::PythonEngine::getDefaultEngine();
+  auto & engine = torch::autograd::Engine::getDefaultEngine();
   return engine.execute(fmap(outputs, get_edge), grad_outputs, true, false, fmap(inputs, get_edge));
 }
 
@@ -506,10 +519,11 @@ std::pair<tensor_list, tensor_list> runGradient(Gradient& grad_spec,
                                                 tensor_list& tensors_in,
                                                 tensor_list& tensor_grads_in) {
   tensor_list tensors_out, tensor_grads_out;
-  Code f_code { grad_spec.f }, df_code { grad_spec.df };
+  Code f_code{grad_spec.f, /*values_are_variables=*/false},
+      df_code{grad_spec.df, /*values_are_variables=*/false};
   InterpreterState f_interpreter { f_code }, df_interpreter { df_code };
 
-  f_interpreter.runOneStage(tensors_in, tensors_out);
+  runOneStage(f_interpreter, tensors_in, tensors_out);
 
   tensor_list df_inputs;
   df_inputs.insert(df_inputs.end(), tensor_grads_in.begin(), tensor_grads_in.end());
@@ -517,7 +531,7 @@ std::pair<tensor_list, tensor_list> runGradient(Gradient& grad_spec,
     df_inputs.push_back(tensors_in[offset]);
   for(auto offset : grad_spec.df_input_captured_outputs)
     df_inputs.push_back(tensors_out[offset]);
-  df_interpreter.runOneStage(df_inputs, tensor_grads_out);
+  runOneStage(df_interpreter, df_inputs, tensor_grads_out);
 
   // Outputs of f needs to be sliced
   tensors_out.erase(tensors_out.begin() + grad_spec.f_real_outputs, tensors_out.end());
@@ -642,7 +656,7 @@ void testCreateAutodiffSubgraphs(std::ostream & out) {
 }
 
 autograd::Variable var(at::Type & t, at::IntList sizes, bool requires_grad) {
-  return autograd::make_variable(t.rand(sizes), requires_grad);
+  return autograd::make_variable(at::rand(t, sizes), requires_grad);
 }
 autograd::Variable undef() {
   return autograd::Variable();
@@ -727,11 +741,11 @@ void shapeAnalysisTest() {
 
   auto v = [](at::Tensor t) { return autograd::make_variable(t, false); };
 
-  auto input = at::CUDA(at::kFloat).randn({batch_size, input_size});
-  auto hx    = at::CUDA(at::kFloat).randn({batch_size, hidden_size});
-  auto cx    = at::CUDA(at::kFloat).randn({batch_size, hidden_size});
-  auto w_ih  = t_def(at::CUDA(at::kFloat).randn({4 * hidden_size, input_size}));
-  auto w_hh  = t_def(at::CUDA(at::kFloat).randn({4 * hidden_size, hidden_size}));
+  auto input = at::randn(at::CUDA(at::kFloat), {batch_size, input_size});
+  auto hx    = at::randn(at::CUDA(at::kFloat), {batch_size, hidden_size});
+  auto cx    = at::randn(at::CUDA(at::kFloat), {batch_size, hidden_size});
+  auto w_ih  = t_def(at::randn(at::CUDA(at::kFloat), {4 * hidden_size, input_size}));
+  auto w_hh  = t_def(at::randn(at::CUDA(at::kFloat), {4 * hidden_size, hidden_size}));
 
   auto g = build_lstm();
   ArgumentSpec spec(false, createVarList({v(input), v(hx), v(cx), v(w_ih), v(w_hh) }));
@@ -753,11 +767,11 @@ void testGraphExecutor() {
 
   auto v = [](at::Tensor t) { return autograd::make_variable(t, false); };
 
-  auto input = at::CUDA(at::kFloat).randn({batch_size, input_size});
-  auto hx    = at::CUDA(at::kFloat).randn({batch_size, hidden_size});
-  auto cx    = at::CUDA(at::kFloat).randn({batch_size, hidden_size});
-  auto w_ih  = t_def(at::CUDA(at::kFloat).randn({4 * hidden_size, input_size}));
-  auto w_hh  = t_def(at::CUDA(at::kFloat).randn({4 * hidden_size, hidden_size}));
+  auto input = at::randn(at::CUDA(at::kFloat), {batch_size, input_size});
+  auto hx    = at::randn(at::CUDA(at::kFloat), {batch_size, hidden_size});
+  auto cx    = at::randn(at::CUDA(at::kFloat), {batch_size, hidden_size});
+  auto w_ih  = t_def(at::randn(at::CUDA(at::kFloat), {4 * hidden_size, input_size}));
+  auto w_hh  = t_def(at::randn(at::CUDA(at::kFloat), {4 * hidden_size, hidden_size}));
 
   std::vector<at::Tensor> inputs = {v(input), v(hx), v(cx), v(w_ih), v(w_hh) };
   auto g = build_lstm();
@@ -774,16 +788,16 @@ void testBlocks(std::ostream & out) {
   auto a = Var::asNewInput(g, "a");
   auto b = Var::asNewInput(g, "b");
   auto c = a + b;
-  auto r = g.appendNode(g.create("If"_sym, {Var::asNewInput(g, "c").value()}));
+  auto r = g.appendNode(g.create(kIf, {Var::asNewInput(g, "c").value()}));
   auto then_block = r->addBlock();
   auto else_block = r->addBlock();
   {
-    WithInsertPoint guard(g, then_block);
+    WithInsertPoint guard(then_block);
     auto t = c + c;
     then_block->registerOutput(t.value());
   }
   {
-    WithInsertPoint guard(g, else_block);
+    WithInsertPoint guard(else_block);
     auto  d = b + c;
     auto e = d + c;
     else_block->registerOutput(e.value());
@@ -799,8 +813,52 @@ void testBlocks(std::ostream & out) {
   out << *g2 << "\n";
 }
 
+
+const static auto cf_examples = R"JIT(
+  def if_test(a, b):
+      c = 0
+      if a < b:
+        c = b
+      else:
+        c = a
+      return c
+  def if_one(a, b):
+    c = b
+    if a < b:
+      c = a
+    return c
+  def while_test(a, i):
+    while i < 3:
+      a *= a
+      i += 1
+    return a
+)JIT";
+void testControlFlow() {
+  script::Module cu(/*optimize=*/true);
+  script::defineMethodsInModule(cu, cf_examples, torch::jit::script::Resolver(), nullptr);
+  auto run = [&](const std::string & name, std::vector<at::Tensor> stack) {
+    auto graph = cu.get_method(name).graph();
+    Code code(graph, /*values_are_variables=*/false);
+    InterpreterState interp(code);
+    interp.runOneStage(stack);
+    return stack;
+  };
+
+  auto F = [](float f) { return at::Scalar(f).toTensor(); };
+  auto V = [](at::Tensor t) { return at::Scalar(t).toFloat(); };
+  auto run_binary = [&](const std::string & name, float a, float b) {
+    return V(run(name, {F(a), F(b)})[0]);
+  };
+  JIT_ASSERT(2 == run_binary("if_test", 1, 2));
+  JIT_ASSERT(3 == run_binary("if_test", 3, 2));
+  JIT_ASSERT(2 == run_binary("if_one", 2, 3));
+  JIT_ASSERT(2 == run_binary("if_one", 3, 2));
+  JIT_ASSERT(256 == run_binary("while_test",2,0));
+}
+
 std::string runJITCPPTests() {
   std::stringstream out;
+  testControlFlow();
   testGraphExecutor();
   testBlocks(out);
   testCreateAutodiffSubgraphs(out);

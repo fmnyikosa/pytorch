@@ -1,3 +1,4 @@
+import copy
 import glob
 import imp
 import os
@@ -49,7 +50,8 @@ def check_compiler_abi_compatibility(compiler):
     Verifies that the given compiler is ABI-compatible with PyTorch.
 
     Arguments:
-        compiler (str): The compiler executable name to check (e.g. 'g++')
+        compiler (str): The compiler executable name to check (e.g. ``g++``).
+            Must be executable in a shell process.
 
     Returns:
         False if the compiler is (likely) ABI-incompatible with PyTorch,
@@ -79,26 +81,33 @@ def check_compiler_abi_compatibility(compiler):
 
 
 class BuildExtension(build_ext):
-    '''A custom build extension for adding compiler-specific options.'''
+    '''
+    A custom :mod:`setuptools` build extension .
+
+    This :class:`setuptools.build_ext` subclass takes care of passing the
+    minimum required compiler flags (e.g. ``-std=c++11``) as well as mixed
+    C++/CUDA compilation (and support for CUDA files in general).
+
+    When using :class:`BuildExtension`, it is allowed to supply a dictionary
+    for ``extra_compile_args`` (rather than the usual list) that maps from
+    languages (``cxx`` or ``cuda``) to a list of additional compiler flags to
+    supply to the compiler. This makes it possible to supply different flags to
+    the C++ and CUDA compiler during mixed compilation.
+    '''
 
     def build_extensions(self):
-        # On some platforms, like Windows, compiler_cxx is not available.
-        if hasattr(self.compiler, 'compiler_cxx'):
-            compiler = self.compiler.compiler_cxx[0]
-        else:
-            compiler = os.environ.get('CXX', 'c++')
-        check_compiler_abi_compatibility(compiler)
-
+        self._check_abi()
         for extension in self.extensions:
-            define = '-DTORCH_EXTENSION_NAME={}'.format(extension.name)
-            extension.extra_compile_args = [define]
+            self._define_torch_extension_name(extension)
 
         # Register .cu and .cuh as valid source extensions.
         self.compiler.src_extensions += ['.cu', '.cuh']
         # Save the original _compile method for later.
         original_compile = self.compiler._compile
 
-        def wrap_compile(obj, src, ext, cc_args, cflags, pp_opts):
+        def wrap_compile(obj, src, ext, cc_args, extra_postargs, pp_opts):
+            # Copy before we make any modifications.
+            cflags = copy.deepcopy(extra_postargs)
             try:
                 original_compiler = self.compiler.compiler_so
                 if _is_cuda_file(src):
@@ -106,10 +115,12 @@ class BuildExtension(build_ext):
                     self.compiler.set_executable('compiler_so', nvcc)
                     if isinstance(cflags, dict):
                         cflags = cflags['nvcc']
-                    cflags += ['-c', '--compiler-options', "'-fPIC'"]
-                else:
-                    if isinstance(cflags, dict):
-                        cflags = cflags['cxx']
+                    cflags += ['--compiler-options', "'-fPIC'"]
+                elif isinstance(cflags, dict):
+                    cflags = cflags['cxx']
+                # NVCC does not allow multiple -std to be passed, so we avoid
+                # overriding the option if the user explicitly passed it.
+                if not any(flag.startswith('-std=') for flag in cflags):
                     cflags.append('-std=c++11')
 
                 original_compile(obj, src, ext, cc_args, cflags, pp_opts)
@@ -122,15 +133,47 @@ class BuildExtension(build_ext):
 
         build_ext.build_extensions(self)
 
+    def _check_abi(self):
+        # On some platforms, like Windows, compiler_cxx is not available.
+        if hasattr(self.compiler, 'compiler_cxx'):
+            compiler = self.compiler.compiler_cxx[0]
+        else:
+            compiler = os.environ.get('CXX', 'c++')
+        check_compiler_abi_compatibility(compiler)
+
+    def _define_torch_extension_name(self, extension):
+        define = '-DTORCH_EXTENSION_NAME={}'.format(extension.name)
+        if isinstance(extension.extra_compile_args, dict):
+            for args in extension.extra_compile_args.values():
+                args.append(define)
+        else:
+            extension.extra_compile_args.append(define)
+
 
 def CppExtension(name, sources, *args, **kwargs):
     '''
-    Create a setuptools.Extension instance for C++.
+    Creates a :class:`setuptools.Extension` for C++.
 
-    Convenience method that creates a `setuptools.Extension` with the bare
-    minimum (but often sufficient) arguments to build a C++ extension.
+    Convenience method that creates a :class:`setuptools.Extension` with the
+    bare minimum (but often sufficient) arguments to build a C++ extension.
 
-    All arguments are forwarded to the setuptools.Extension constructor.
+    All arguments are forwarded to the :class:`setuptools.Extension`
+    constructor.
+
+    Example:
+        >>> from setuptools import setup
+        >>> from torch.utils.cpp_extension import BuildExtension, CppExtension
+        >>> setup(
+                name='extension',
+                ext_modules=[
+                    CppExtension(
+                        name='extension',
+                        sources=['extension.cpp'],
+                        extra_compile_args=['-g'])),
+                ],
+                cmdclass={
+                    'build_ext': BuildExtension
+                })
     '''
     include_dirs = kwargs.get('include_dirs', [])
     include_dirs += include_paths()
@@ -141,13 +184,31 @@ def CppExtension(name, sources, *args, **kwargs):
 
 def CUDAExtension(name, sources, *args, **kwargs):
     '''
-    Create a setuptools.Extension instance for CUDA/C++.
+    Creates a :class:`setuptools.Extension` for CUDA/C++.
 
-    Convenience method that creates a `setuptools.Extension` with the bare
-    minimum (but often sufficient) arguments to build a CUDA/C++ extension.
-    This includes the CUDA include path, library path and runtime library.
+    Convenience method that creates a :class:`setuptools.Extension` with the
+    bare minimum (but often sufficient) arguments to build a CUDA/C++
+    extension. This includes the CUDA include path, library path and runtime
+    library.
 
-    All arguments are forwarded to the setuptools.Extension constructor.
+    All arguments are forwarded to the :class:`setuptools.Extension`
+    constructor.
+
+    Example:
+        >>> from setuptools import setup
+        >>> from torch.utils.cpp_extension import BuildExtension, CppExtension
+        >>> setup(
+                name='cuda_extension',
+                ext_modules=[
+                    CUDAExtension(
+                            name='cuda_extension',
+                            sources=['extension.cpp', 'extension_kernel.cu'],
+                            extra_compile_args={'cxx': ['-g'],
+                                                'nvcc': ['-O2']})
+                ],
+                cmdclass={
+                    'build_ext': BuildExtension
+                })
     '''
     library_dirs = kwargs.get('library_dirs', [])
     library_dirs.append(_join_cuda_home('lib64'))
@@ -168,17 +229,24 @@ def CUDAExtension(name, sources, *args, **kwargs):
 
 def include_paths(cuda=False):
     '''
-    Return include paths required to build a C++ extension.
+    Get the include paths required to build a C++ or CUDA extension.
 
     Args:
-        cuda: If `True`, includes CUDA include paths.
+        cuda: If `True`, includes CUDA-specific include paths.
 
     Returns:
         A list of include path strings.
     '''
     here = os.path.abspath(__file__)
     torch_path = os.path.dirname(os.path.dirname(here))
-    paths = [os.path.join(torch_path, 'lib', 'include')]
+    lib_include = os.path.join(torch_path, 'lib', 'include')
+    # Some internal (old) Torch headers don't properly prefix their includes,
+    # so we need to pass -Itorch/lib/include/TH as well.
+    paths = [
+        lib_include,
+        os.path.join(lib_include, 'TH'),
+        os.path.join(lib_include, 'THC')
+    ]
     if cuda:
         paths.append(_join_cuda_home('include'))
     return paths
@@ -193,7 +261,7 @@ def load(name,
          build_directory=None,
          verbose=False):
     '''
-    Loads a C++ PyTorch extension.
+    Loads a PyTorch C++ extension just-in-time (JIT).
 
     To load an extension, a Ninja build file is emitted, which is used to
     compile the given sources into a dynamic library. This library is
@@ -201,29 +269,31 @@ def load(name,
     returned from this function, ready for use.
 
     By default, the directory to which the build file is emitted and the
-    resulting library compiled to is `<tmp>/torch_extensions`, where `<tmp>` is
-    the temporary folder on the current platform. This location can be
-    overriden in two ways. First, if the `TORCH_EXTENSIONS_DIR` environment
-    variable is set, it replaces `<tmp>` and all extensions will be compiled
-    into subfolders of this directory. Second, if the `build_directory`
+    resulting library compiled to is ``<tmp>/torch_extensions/<name>``, where
+    ``<tmp>`` is the temporary folder on the current platform and ``<name>``
+    the name of the extension. This location can be overriden in two ways.
+    First, if the ``TORCH_EXTENSIONS_DIR`` environment variable is set, it
+    replaces ``<tmp>/torch_extensions`` and all extensions will be compiled
+    into subfolders of this directory. Second, if the ``build_directory``
     argument to this function is supplied, it overrides the entire path, i.e.
     the library will be compiled into that folder directly.
 
-    To compile the sources, the default system compiler (`c++`) is used, which
-    can be overriden by setting the CXX environment variable. To pass
-    additional arguments to the compilation process, `extra_cflags` or
-    `extra_ldflags` can be provided. For example, to compile your extension
-    with optimizations, pass `extra_cflags=['-O3']`. You can also use
-    `extra_cflags` to pass further include directories (`-I`).
+    To compile the sources, the default system compiler (``c++``) is used,
+    which can be overriden by setting the ``CXX`` environment variable. To pass
+    additional arguments to the compilation process, ``extra_cflags`` or
+    ``extra_ldflags`` can be provided. For example, to compile your extension
+    with optimizations, pass ``extra_cflags=['-O3']``. You can also use
+    ``extra_cflags`` to pass further include directories.
 
     CUDA support with mixed compilation is provided. Simply pass CUDA source
-    files (`.cu` or `.cuh`) along with other sources. Such files will be
+    files (``.cu`` or ``.cuh``) along with other sources. Such files will be
     detected and compiled with nvcc rather than the C++ compiler. This includes
     passing the CUDA lib64 directory as a library directory, and linking
-    `cudart`. You can pass additional flags to nvcc via `extra_cuda_cflags`,
-    just like with `extra_cflags` for C++. Various heuristics for finding the
-    CUDA install directory are used, which usually work fine. If not, setting
-    the `CUDA_HOME` environment variable is the safest option.
+    ``cudart``. You can pass additional flags to nvcc via
+    ``extra_cuda_cflags``, just like with ``extra_cflags`` for C++. Various
+    heuristics for finding the CUDA install directory are used, which usually
+    work fine. If not, setting the ``CUDA_HOME`` environment variable is the
+    safest option.
 
     Args:
         name: The name of the extension to build. This MUST be the same as the
@@ -236,10 +306,18 @@ def load(name,
         extra_include_paths: optional list of include directories to forward
             to the build.
         build_directory: optional path to use as build workspace.
-        verbose: If `True`, turns on verbose logging of load steps.
+        verbose: If ``True``, turns on verbose logging of load steps.
 
     Returns:
         The loaded PyTorch extension as a Python module.
+
+    Example:
+        >>> from torch.utils.cpp_extension import load
+        >>> module = load(
+                name='extension',
+                sources=['extension.cpp', 'extension_kernel.cu'],
+                extra_cflags=['-O2'],
+                verbose=True)
     '''
 
     verify_ninja_availability()
@@ -284,6 +362,10 @@ def load(name,
 
 
 def verify_ninja_availability():
+    '''
+    Returns ``True`` if the `ninja <https://ninja-build.org/>`_ build system is
+    available on the system.
+    '''
     with open(os.devnull, 'wb') as devnull:
         try:
             subprocess.check_call('ninja --version'.split(), stdout=devnull)
@@ -356,18 +438,22 @@ def _write_ninja_file(path,
     # sysconfig.get_paths()['include'] gives us the location of Python.h
     includes.append(sysconfig.get_paths()['include'])
 
-    cflags = ['-fPIC', '-std=c++11', '-DTORCH_EXTENSION_NAME={}'.format(name)]
-    cflags += ['-I{}'.format(include) for include in includes]
-    cflags += extra_cflags
+    common_cflags = ['-DTORCH_EXTENSION_NAME={}'.format(name)]
+    common_cflags += ['-I{}'.format(include) for include in includes]
+
+    cflags = common_cflags + ['-fPIC', '-std=c++11'] + extra_cflags
     flags = ['cflags = {}'.format(' '.join(cflags))]
 
     if with_cuda:
-        cuda_flags = "--compiler-options '-fPIC'"
-        extra_flags = ' '.join(extra_cuda_cflags)
-        flags.append('cuda_flags = {} {}'.format(cuda_flags, extra_flags))
+        cuda_flags = common_cflags
+        cuda_flags += ['--compiler-options', "'-fPIC'"]
+        cuda_flags += extra_cuda_cflags
+        if not any(flag.startswith('-std=') for flag in cuda_flags):
+            cuda_flags.append('-std=c++11')
+        flags.append('cuda_flags = {}'.format(' '.join(cuda_flags)))
 
     ldflags = ['-shared'] + extra_ldflags
-    # The darwin linker needs explicit consent to ignore unresolved symbols
+    # The darwin linker needs explicit consent to ignore unresolved symbols.
     if sys.platform == 'darwin':
         ldflags.append('-undefined dynamic_lookup')
     flags.append('ldflags = {}'.format(' '.join(ldflags)))
@@ -393,9 +479,15 @@ def _write_ninja_file(path,
     for source_file in sources:
         # '/path/to/file.cpp' -> 'file'
         file_name = os.path.splitext(os.path.basename(source_file))[0]
-        target = '{}.o'.format(file_name)
+        if _is_cuda_file(source_file):
+            rule = 'cuda_compile'
+            # Use a different object filename in case a C++ and CUDA file have
+            # the same filename but different extension (.cpp vs. .cu).
+            target = '{}.cuda.o'.format(file_name)
+        else:
+            rule = 'compile'
+            target = '{}.o'.format(file_name)
         object_files.append(target)
-        rule = 'cuda_compile' if _is_cuda_file(source_file) else 'compile'
         build.append('build {}: {} {}'.format(target, rule, source_file))
 
     library_target = '{}.so'.format(name)

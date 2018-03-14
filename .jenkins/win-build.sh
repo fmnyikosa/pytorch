@@ -1,5 +1,6 @@
 #!/bin/bash
 
+COMPACT_JOB_NAME=pytorch-win-ws2016-cuda9-cudnn7-py3-build
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 export IMAGE_COMMIT_TAG=${BUILD_ENVIRONMENT}-${IMAGE_COMMIT_ID}
@@ -75,6 +76,16 @@ set DISTUTILS_USE_SDK=1
 set CMAKE_GENERATOR=Ninja
 
 xcopy /Y aten\\src\\ATen\\common_with_cwrap.py tools\\shared\\cwrap_common.py
+
+set NO_CUDA=1
+
+python setup.py install
+
+if %errorlevel% neq 0 exit /b %errorlevel%
+
+rd /s /q C:\\Jenkins\\Miniconda3\\Lib\\site-packages\\torch
+
+set NO_CUDA=
 
 python setup.py install && 7z a %IMAGE_COMMIT_TAG%.7z C:\\Jenkins\\Miniconda3\\Lib\\site-packages\\torch && python ci_scripts\\upload_image.py %IMAGE_COMMIT_TAG%.7z
 

@@ -11,7 +11,7 @@
 //     "norm(Scalar p, int64_t dim, bool keepdim=False)",
 //     "norm(Scalar p=2)",
 //   });
-//   PyObject* parsed_args[3];
+//   ParsedArgs<3> parsed_args;
 //   auto r = parser.parse(args, kwargs, parsed_args);
 //   if (r.idx == 0) {
 //     norm(r.scalar(0), r.int64(1), r.bool(0));
@@ -26,16 +26,16 @@
 #include <vector>
 #include <ATen/ATen.h>
 
-#include "torch/csrc/THP.h"
-#include "torch/csrc/utils/object_ptr.h"
-#include "torch/csrc/Exceptions.h"
-#include "torch/csrc/autograd/python_variable.h"
-#include "torch/csrc/utils/python_numbers.h"
 #include "torch/csrc/DynamicTypes.h"
 #include "torch/csrc/Dtype.h"
+#include "torch/csrc/Exceptions.h"
+#include "torch/csrc/Generator.h"
+#include "torch/csrc/autograd/python_variable.h"
 #include "torch/csrc/autograd/generated/VariableType.h"
-
-extern at::Type* THPDefaultATenType;
+#include "torch/csrc/tensor/python_tensor.h"
+#include "torch/csrc/utils/object_ptr.h"
+#include "torch/csrc/utils/python_numbers.h"
+#include "torch/csrc/utils/numpy_stub.h"
 
 namespace torch {
 
@@ -48,14 +48,22 @@ struct FunctionParameter;
 struct FunctionSignature;
 struct PythonArgs;
 
+// Contains bound Python arguments in declaration order
+template<int N>
+struct ParsedArgs {
+  PyObject* args[N];
+};
+
 struct PythonArgParser {
   explicit PythonArgParser(std::vector<std::string> fmts);
 
-  PythonArgs parse(PyObject* args, PyObject* kwargs, PyObject* dst[]);
+  template<int N>
+  inline PythonArgs parse(PyObject* args, PyObject* kwargs, ParsedArgs<N>& dst);
 
 private:
   [[noreturn]]
   void print_error(PyObject* args, PyObject* kwargs, PyObject* dst[]);
+  PythonArgs raw_parse(PyObject* args, PyObject* kwargs, PyObject* dst[]);
 
   std::vector<FunctionSignature> signatures_;
   std::string function_name;
@@ -131,8 +139,18 @@ struct FunctionParameter {
     bool default_bool;
     int64_t default_int;
     double default_double;
+    at::Type* default_type;
   };
 };
+
+template<int N>
+inline PythonArgs PythonArgParser::parse(PyObject* args, PyObject* kwargs, ParsedArgs<N>& dst) {
+  if (N < max_args) {
+    throw ValueError("dst does not have enough capacity, expected %d (got %d)",
+        (int)max_args, N);
+  }
+  return raw_parse(args, kwargs, dst.args);
+}
 
 inline at::Tensor PythonArgs::tensor(int i) {
   if (!args[i]) return at::Tensor();
@@ -142,7 +160,8 @@ inline at::Tensor PythonArgs::tensor(int i) {
     // a test for Py_None here; instead, you need to mark the argument
     // as *allowing none*; you can do this by writing 'Tensor?' instead
     // of 'Tensor' in the ATen metadata.
-    throw TypeError("expected Variable as argument %d, but got %s", i, THPUtils_typename(args[i]));
+    throw TypeError("expected Variable as argument %d, but got %s", i,
+        Py_TYPE(args[i])->tp_name);
   }
   return reinterpret_cast<THPVariable*>(args[i])->cdata;
 }
@@ -174,7 +193,7 @@ inline std::vector<at::Tensor> PythonArgs::tensorlist(int i) {
     PyObject* obj = tuple ? PyTuple_GET_ITEM(arg, idx) : PyList_GET_ITEM(arg, idx);
     if (!THPVariable_Check(obj)) {
       throw TypeError("expected Variable as element %d in argument %d, but got %s",
-                 idx, i, THPUtils_typename(args[i]));
+                 idx, i, Py_TYPE(args[i])->tp_name);
     }
     res[idx] = reinterpret_cast<THPVariable*>(obj)->cdata;
   }
@@ -195,7 +214,7 @@ inline std::array<at::Tensor, N> PythonArgs::tensorlist_n(int i) {
     PyObject* obj = tuple ? PyTuple_GET_ITEM(arg, idx) : PyList_GET_ITEM(arg, idx);
     if (!THPVariable_Check(obj)) {
       throw TypeError("expected Variable as element %d in argument %d, but got %s",
-                 idx, i, THPUtils_typename(args[i]));
+                 idx, i, Py_TYPE(args[i])->tp_name);
     }
     res[idx] = reinterpret_cast<THPVariable*>(obj)->cdata;
   }
@@ -229,19 +248,11 @@ inline std::vector<int64_t> PythonArgs::intlistWithDefault(int i, std::vector<in
   return res;
 }
 
-static at::Type& default_type() {
-  if (!THPDefaultATenType) {
-    throw std::runtime_error("THPDefaultATenType not initialized");
-  }
-  return *torch::autograd::VariableType::getType(*THPDefaultATenType);
-}
-
 inline const at::Type& PythonArgs::type(int i) {
-  return typeWithDefault(i, default_type());
-}
-
-inline const at::Type& PythonArgs::typeWithDefault(int i, const at::Type& default_type) {
-  if (!args[i]) return default_type;
+  if (!args[i]) {
+    auto type = signature.params[i].default_type;
+    return type ? *type : torch::tensor::get_default_tensor_type();
+  }
   THPDtype* dtype = reinterpret_cast<THPDtype*>(args[i]);
   if (dtype->cdata == nullptr) {
     std::ostringstream oss;
@@ -252,6 +263,11 @@ inline const at::Type& PythonArgs::typeWithDefault(int i, const at::Type& defaul
     throw std::runtime_error(oss.str());
   }
   return *(dtype->cdata);
+}
+
+inline const at::Type& PythonArgs::typeWithDefault(int i, const at::Type& default_type) {
+  if (!args[i]) return default_type;
+  return type(i);
 }
 
 inline int64_t PythonArgs::toInt64(int i) {

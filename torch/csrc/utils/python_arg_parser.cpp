@@ -115,11 +115,11 @@ bool FunctionParameter::check(PyObject* obj) {
 
 std::string FunctionParameter::type_name() const {
   switch (type_) {
-    case ParameterType::TENSOR: return "Variable";
+    case ParameterType::TENSOR: return "Tensor";
     case ParameterType::SCALAR: return "float";
     case ParameterType::INT64: return "int";
     case ParameterType::DOUBLE: return "float";
-    case ParameterType::TENSOR_LIST: return "tuple of Variables";
+    case ParameterType::TENSOR_LIST: return "tuple of Tensors";
     case ParameterType::INT_LIST: return "tuple of ints";
     case ParameterType::GENERATOR: return "torch.Generator";
     case ParameterType::BOOL: return "bool";
@@ -157,8 +157,12 @@ void FunctionParameter::set_default_str(const std::string& str) {
       default_intlist.assign(size, std::stoi(str));
     }
   } else if (type_ == ParameterType::TYPE) {
-    if (str != "None") {
-      throw std::runtime_error("default value for Type must be none, got: " + str);
+    if (str == "None") {
+      default_type = nullptr;
+    } else if (str == "torch.int64") {
+      default_type = torch::autograd::VariableType::getType(CPU(kLong));
+    } else {
+      throw std::runtime_error("invalid default value for dtype: " + str);
     }
   }
 }
@@ -417,7 +421,7 @@ PythonArgParser::PythonArgParser(std::vector<std::string> fmts)
   }
 }
 
-PythonArgs PythonArgParser::parse(PyObject* args, PyObject* kwargs, PyObject* parsed_args[]) {
+PythonArgs PythonArgParser::raw_parse(PyObject* args, PyObject* kwargs, PyObject* parsed_args[]) {
   if (signatures_.size() == 1) {
     auto& signature = signatures_[0];
     signature.parse(args, kwargs, parsed_args, true);

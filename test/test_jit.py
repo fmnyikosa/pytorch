@@ -4,19 +4,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 import unittest
 from contextlib import contextmanager
-from itertools import product
+from itertools import product, chain
 import torch.jit.frontend
 from torch.autograd import Variable, Function
 from torch.autograd.function import traceable
 from common import TestCase, run_tests, IS_WINDOWS
 import io
 import sys
+import numpy as np
 
 try:
     import torchvision
     HAS_TORCHVISION = True
 except ImportError:
     HAS_TORCHVISION = False
+
 
 skipIfNoTorchVision = unittest.skipIf(not HAS_TORCHVISION, "no torchvision")
 
@@ -31,6 +33,47 @@ if torch.cuda.is_available():
 RUN_CUDA_MULTI_GPU = RUN_CUDA and torch.cuda.device_count() > 1
 
 PY2 = sys.version_info[0] == 2
+WINDOWS = sys.platform == 'win32'
+
+
+@contextmanager
+def capture_stdout():
+    # No idea how to capture stdout from C++ on Windows
+    if WINDOWS:
+        yield ['']
+        return
+    import os
+    import fcntl
+    import errno
+    stdout_fd = os.dup(1)
+    r, w = os.pipe()
+    try:
+        # Override stdout with r - dup is guaranteed to return the lowest free fd
+        os.close(1)
+        os.dup(w)
+
+        captured_stdout = ['']
+        yield captured_stdout
+        sys.stdout.flush()  # Make sure that Python hasn't buffered anything
+
+        # Do the ugly dance to read all the data that was written into the pipe
+        fcntl.fcntl(r, fcntl.F_SETFL, os.O_NONBLOCK)
+        total_stdout = ''
+        while True:
+            try:
+                total_stdout += os.read(r, 1000).decode('ascii')
+            except OSError as e:
+                if e.errno != errno.EAGAIN:
+                    raise
+                break
+        captured_stdout[0] = total_stdout
+    finally:
+        # Revert the change, and clean up all fds
+        os.close(1)
+        os.dup(stdout_fd)
+        os.close(stdout_fd)
+        os.close(r)
+        os.close(w)
 
 
 def LSTMCell(input, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
@@ -79,7 +122,7 @@ class TestJit(TestCase):
         def f(x, y):
             return torch.sigmoid(torch.tanh(x * (x + y)))
 
-        trace, z = torch.jit.trace(f, (x, y), nderivs=0)
+        trace, z = torch.jit.get_trace_graph(f, (x, y), nderivs=0)
         self.assertExpectedTrace(trace)
 
     # matmul is currently implemented as a native function, which
@@ -91,7 +134,7 @@ class TestJit(TestCase):
         x = Variable(torch.Tensor([[0.4]]), requires_grad=True)
         y = Variable(torch.Tensor([[0.7]]), requires_grad=True)
 
-        trace, z = torch.jit.trace(lambda x, y: x.matmul(y), (x, y), nderivs=0)
+        trace, z = torch.jit.get_trace_graph(lambda x, y: x.matmul(y), (x, y), nderivs=0)
         torch._C._jit_pass_lint(trace)
         torch._C._jit_pass_dce(trace)
         self.assertExpectedTrace(trace)
@@ -160,7 +203,7 @@ class TestJit(TestCase):
                 out = torch.sigmoid(out)
             return out
 
-        trace, z = torch.jit.trace(f, (x, y), nderivs=0)
+        trace, z = torch.jit.get_trace_graph(f, (x, y), nderivs=0)
         self.assertExpectedTrace(trace)
 
     def test_scopes_intermediate_node(self):
@@ -171,7 +214,7 @@ class TestJit(TestCase):
 
         net = Net()
         t = Variable(torch.ones(2), requires_grad=True)
-        trace, _ = torch.jit.trace(net, (t, ))
+        trace, _ = torch.jit.get_trace_graph(net, (t, ))
         torch.onnx._optimize_trace(trace, False)
 
         self.assertExpectedTrace(trace)
@@ -197,7 +240,7 @@ class TestJit(TestCase):
         t = Variable(torch.ones(1, 3, 227, 227), requires_grad=True)
 
         with torch.onnx.set_training(model, False):
-            trace, _ = torch.jit.trace(model, (t, ))
+            trace, _ = torch.jit.get_trace_graph(model, (t, ))
 
         torch.onnx._optimize_trace(trace, False)
 
@@ -211,7 +254,7 @@ class TestJit(TestCase):
         cx = Variable(torch.randn(3, 20).float().cuda())
         module = nn.LSTMCell(10, 20).float().cuda()  # Just to allocate weights with correct sizes
 
-        trace, _ = torch.jit.trace(LSTMCell, (input, (hx, cx)) + tuple(module.parameters()))
+        trace, _ = torch.jit.get_trace_graph(LSTMCell, (input, (hx, cx)) + tuple(module.parameters()))
         torch._C._jit_pass_lint(trace)
         torch._C._jit_pass_dce(trace)
         torch._C._jit_pass_lint(trace)
@@ -273,7 +316,7 @@ class TestJit(TestCase):
         def Foo(hx, cx):
             return torch.cat((hx + cx, hx * cx))
 
-        trace, _ = torch.jit.trace(Foo, (hx, cx))
+        trace, _ = torch.jit.get_trace_graph(Foo, (hx, cx))
         torch._C._jit_pass_lint(trace)
         torch._C._jit_pass_fuse(trace)
         self.assertExpectedTrace(trace)
@@ -286,7 +329,7 @@ class TestJit(TestCase):
             return z1 * z2
         x = Variable(torch.randn(4, 4).float().cuda())
         y = Variable(torch.randn(4, 4).float().cuda())
-        trace, _ = torch.jit.trace(f, (x, y), nderivs=0)
+        trace, _ = torch.jit.get_trace_graph(f, (x, y), nderivs=0)
         torch._C._jit_pass_lint(trace)
         torch._C._jit_pass_dce(trace)
         self.assertExpectedTrace(trace, 'raw')
@@ -444,12 +487,12 @@ class TestJit(TestCase):
                 return a * grad_a
 
         x = Variable(torch.randn(10, 10), requires_grad=True)
-        trace, out = torch.jit.trace(MyFn.apply, x, nderivs=1)
+        trace, out = torch.jit.get_trace_graph(MyFn.apply, x, nderivs=1)
         out.sum().backward()
         torch._C._jit_pass_dce(trace)
         self.assertExpectedTrace(trace)
 
-    def test_traced_module(self):
+    def test_legacy_traced_module(self):
         input = Variable(torch.randn(3, 10))
         hx = Variable(torch.randn(3, 20))
         cx = Variable(torch.randn(3, 20))
@@ -858,7 +901,7 @@ class TestJit(TestCase):
         def doit(x, y):
             return torch.sigmoid(torch.tanh(x * (x + y)))
 
-        traced, _ = torch.jit.trace(doit, (x, y))
+        traced, _ = torch.jit.get_trace_graph(doit, (x, y))
         g = torch._C._jit_get_graph(traced)
         g2 = torch._C.Graph()
         g_to_g2 = {}
@@ -887,13 +930,13 @@ class TestJit(TestCase):
         self.assertExpected(torch._C._jit_run_cpp_tests())
 
     def test_batchnorm(self):
-        x = Variable(torch.randn(2, 2).fill_(1.0), requires_grad=True)
-        trace, _ = torch.jit.trace(nn.BatchNorm2d(2), x)
+        x = Variable(torch.randn(2, 2, 2, 2).fill_(1.0), requires_grad=True)
+        trace, _ = torch.jit.get_trace_graph(nn.BatchNorm2d(2), x)
         self.assertExpectedTrace(trace)
 
     def test_dropout(self):
         x = Variable(torch.randn(2, 2).fill_(1.0), requires_grad=True)
-        trace, _ = torch.jit.trace(nn.Dropout(0.6), x)
+        trace, _ = torch.jit.get_trace_graph(nn.Dropout(0.6), x)
         self.assertExpectedTrace(trace)
 
     def test_batchnorm_run_twice(self):
@@ -902,7 +945,7 @@ class TestJit(TestCase):
             pass
 
         bn = MyBatchNorm2d(1)
-        x = Variable(torch.randn(5, 1))
+        x = Variable(torch.randn(5, 1, 2, 1))
         z = bn(x)
         with self.assertCompiled(bn):
             z2 = bn(x)
@@ -914,7 +957,7 @@ class TestJit(TestCase):
 
     def test_conv(self):
         x = Variable(torch.randn(20, 16, 50, 40).fill_(1.0), requires_grad=True)
-        trace, _ = torch.jit.trace(nn.Conv2d(16, 13, 3, bias=False), x)
+        trace, _ = torch.jit.get_trace_graph(nn.Conv2d(16, 13, 3, bias=False), x)
         self.assertExpectedTrace(trace)
 
     def test_reuse_function(self):
@@ -1102,7 +1145,7 @@ class TestJit(TestCase):
     def test_alexnet(self):
         return
         x = Variable(torch.randn(10, 3, 224, 224).fill_(1.0), requires_grad=True)
-        trace, _ = torch.jit.trace(torchvision.models.AlexNet(), x)
+        trace, _ = torch.jit.get_trace_graph(torchvision.models.AlexNet(), x)
         self.assertExpectedTrace(trace)
         # NB: Purposely NOT testing protobuf export here
 
@@ -1140,14 +1183,14 @@ class TestJit(TestCase):
             out.copy_(x)
             return out
 
-        trace, z = torch.jit.trace(f, (x, ), nderivs=0)
+        trace, z = torch.jit.get_trace_graph(f, (x, ), nderivs=0)
         torch._C._jit_pass_lint(trace)
         torch._C._jit_pass_dce(trace)
         self.assertExpectedTrace(trace)
 
     def test_index_trace(self):
         x = Variable(torch.randn(4, 4), requires_grad=True)
-        trace, z = torch.jit.trace(lambda x: x[0], (x, ), nderivs=1)
+        trace, z = torch.jit.get_trace_graph(lambda x: x[0], (x, ), nderivs=1)
         z.sum().backward()
         torch._C._jit_pass_lint(trace)
         torch._C._jit_pass_dce(trace)
@@ -1174,13 +1217,13 @@ class TestJit(TestCase):
                 return x * self.a + self.b
 
         m = MyModule()
-        trace, _ = torch.jit.trace(m, (Variable(torch.randn(2, 2)),), nderivs=0)
+        trace, _ = torch.jit.get_trace_graph(m, (Variable(torch.randn(2, 2)),), nderivs=0)
         self.assertEqual(len(list(trace.graph().inputs())), 2)
         self.assertExpected(str(trace))
 
     def test_nested_inplace(self):
         x = Variable(torch.randn(2, 2))
-        trace, _ = torch.jit.trace(lambda x: F.threshold(x, 0, 0, inplace=True), (x,), nderivs=0)
+        trace, _ = torch.jit.get_trace_graph(lambda x: F.threshold(x, 0, 0, inplace=True), (x,), nderivs=0)
         self.assertExpectedTrace(trace)
 
     def checkGraphExecutor(self, func, reference_tensors, input_tensors=None, optimize=True, drop=None):
@@ -1199,7 +1242,7 @@ class TestJit(TestCase):
         recording_inputs = [Variable(t, requires_grad=True)
                             for t in reference_tensors]
 
-        ge = torch._C.GraphExecutor(func, [Variable(t) for t in input_tensors], optimize)
+        ge = torch._C.GraphExecutor(func, [Variable(t) for t in input_tensors], [], optimize)
 
         # test no gradients case
 
@@ -1301,96 +1344,107 @@ class TestJit(TestCase):
         g2result2 = torch.autograd.grad(l3, [da2, db2])
         self.assertEqual(g2result, g2result2)
 
-    def checkScript(self, script, inputs, outputs, optimize, name='func'):
-        cu = torch.jit._jit_script_compile(script)
-        graph = cu.get_graph(name)
-        ge = torch._C.GraphExecutor(graph, optimize)
-        outputs_ge = ge(*inputs)
+    def checkScript(self, script, inputs, outputs, optimize, name='func', capture_output=False):
+        if isinstance(script, str):
+            cu = torch.jit.CompilationUnit(script, optimize)
+            ge = getattr(cu, name)
+        else:
+            ge = torch.jit.script(script)
+
+        if capture_output:
+            with capture_stdout() as captured:
+                outputs_ge = ge(*inputs)
+            if not WINDOWS:
+                self.assertExpected(captured[0], subname='stdout')
+        else:
+            outputs_ge = ge(*inputs)
         self.assertEqual(outputs, outputs_ge)
 
     def test_script_add(self):
         script = '''
-        def func(a, b) -> (c):
+        def func(a, b):
             c = a + b
             c += a
+            return c
         '''
 
         a = Variable(torch.rand(1), requires_grad=True)
         b = Variable(torch.rand(1), requires_grad=True)
         outputs = a + b + a
-        self.checkScript(script, [a, b], [outputs], False)
+        self.checkScript(script, [a, b], outputs, True)
 
     def test_script_mul(self):
         script = '''
-        def func(a, b) -> (c):
-            c = a * b
+        def func(a, b):
+            return a * b
         '''
 
         a = Variable(torch.rand(1), requires_grad=True)
         b = Variable(torch.rand(1), requires_grad=True)
         outputs = a * b
-        self.checkScript(script, [a, b], [outputs], False)
+        self.checkScript(script, [a, b], outputs, True)
 
-    @unittest.skip("RuntimeError: Expected object of type CPUFloatType "
-                   "but found type Variable[CPUFloatType] for argument #2 'other'")
     def test_script_triple(self):
         script = '''
-        def func(x) -> (y):
-            y = 3f * x
+        def func(x):
+            return 3f * x
         '''
         x = Variable(torch.rand(1).float(), requires_grad=True)
         outputs = 3 * x
-        self.checkScript(script, [x], [outputs], False)
+        self.checkScript(script, [x], outputs, True)
 
     def test_script_slice(self):
         script = '''
-        def func(x) -> (head):
-            head = x[:5]
+        def func(x):
+            return x[:5]
         '''
         x = Variable(torch.rand(10).float(), requires_grad=True)
         outputs = x[:5]
-        self.checkScript(script, [x], [outputs], False)
+        self.checkScript(script, [x], outputs, True)
 
     def test_script_gather(self):
         script = '''
-        def func(x) -> (y):
-            y = x[0]
+        def func(x):
+            return x[0]
         '''
         x = Variable(torch.rand(10).float(), requires_grad=True)
         outputs = x[0]
-        self.checkScript(script, [x], [outputs], False)
+        self.checkScript(script, [x], outputs, True)
 
     def test_script_func_call(self):
         script = '''
-        def add(a, b) -> (c):
-            c = a + b
+        def add(a, b):
+            return a + b
 
-        def mul(a, x) -> (y):
-            y = a * x
+        def mul(a, x):
+            return a * x
 
-        def func(alpha, beta, x, y) -> (z):
-            z = add(mul(alpha, x), mul(beta, y))
+        def func(alpha, beta, x, y):
+            return add(mul(alpha, x), mul(beta, y))
         '''
         alpha = Variable(torch.rand(1).float(), requires_grad=True)
         beta = Variable(torch.rand(1).float(), requires_grad=True)
         x = Variable(torch.rand(3).float(), requires_grad=True)
         y = Variable(torch.rand(3).float(), requires_grad=True)
         outputs = alpha * x + beta * y
-        self.checkScript(script, [alpha, beta, x, y], [outputs], False)
+        # note - cannot optimize yet because broadcasts are not inserted
+        # before the fuser runs
+        self.checkScript(script, [alpha, beta, x, y], outputs, False)
 
     @unittest.skip("RuntimeError: VariableType::ID() not implemented")
     def test_script_cast(self):
         script = '''
-        def to_int(x) -> (y):
-            y = int(x)
+        def to_int(x):
+            return int(x)
         '''
         x = Variable(torch.FloatTensor([1.1, 2.3]), requires_grad=True)
         outputs = Variable(torch.IntTensor([1, 2]), requires_grad=True)
-        self.checkScript(script, 'to_int', [x], [outputs], False)
+        self.checkScript(script, 'to_int', [x], [outputs], True)
 
     def test_python_frontend(self):
         def fn(x, y, z):
-            q = x + y - z
+            q = x + y - z.sigmoid()
+            print(q)
             w = -z
             if not x and not y and z:
                 m = x if not z else y
@@ -1401,25 +1455,34 @@ class TestJit(TestCase):
         ast = torch.jit.frontend.get_jit_ast(fn)
         self.assertExpected(str(ast))
 
+    def _make_scalar_vars(self, arr, dtype):
+        out = []
+        for inp in arr:
+            out.append(torch.from_numpy(np.array(inp, dtype=dtype)))
+        return out
+
     def test_script_while(self):
-        cu = torch.jit._jit_script_compile('''
-        def test_while(a, b) -> (c):
-            while a < 10:
+        script = '''
+        def test_while(a, b, max):
+            while a < max:
                 a = a + 1
                 b = b + 1
             c = a + b
-        ''')
-        self.assertExpected(str(cu.get_graph('test_while')))
+            return c
+        '''
+        inputs = self._make_scalar_vars([1, 1, 10], np.int32)
+        outputs = self._make_scalar_vars([20], np.int32)
+        self.checkScript(script, inputs, outputs[0], True, 'test_while')
 
     def test_script_fibb(self):
-        cu = torch.jit._jit_script_compile('''
-        def test_while(lim) -> (third):
+        script = '''
+        def test_while(lim):
             first = 1
             second = 1
             i = 1
             somenum = 5
             dontmutateme = 3
-            third = 0 # TODO: python lexical scoping
+            third = 0
             while i < lim:
                 third = first + second
                 first = second
@@ -1433,13 +1496,15 @@ class TestJit(TestCase):
 
             st = second + third
             fs = first + second
-
-        ''')
-        self.assertExpected(str(cu.get_graph('test_while')))
+            return third, st, fs
+        '''
+        inputs = self._make_scalar_vars([10], np.int32)
+        outputs = self._make_scalar_vars([2, 4, 3], np.int32)
+        self.checkScript(script, inputs, outputs, True, 'test_while')
 
     def test_script_if(self):
-        cu = torch.jit._jit_script_compile('''
-        def test_if(a, b) -> (c):
+        script = '''
+        def test_if(a, b):
             d = 3
             if a > 10:
                 a = 3 + d
@@ -1447,51 +1512,59 @@ class TestJit(TestCase):
                 b = 3 + d
                 d = 4
             c = a + b
-        ''')
-        self.assertExpected(str(cu.get_graph('test_if')))
+            return c
+        '''
+        inputs = self._make_scalar_vars([1, -1], np.int32)
+        outputs = self._make_scalar_vars([7], np.int32)
+        self.checkScript(script, inputs, outputs[0], True, 'test_if')
 
     def test_script_if_noelse(self):
-        cu = torch.jit._jit_script_compile('''
-        def test_if_noelse(a, b) -> (c):
+        script = '''
+        def test_if_noelse(a, b):
             if a > 10:
                 a = 3 + b
             c = a + b
-        ''')
-        self.assertExpected(str(cu.get_graph('test_if_noelse')))
+            return c
+        '''
+        inputs = self._make_scalar_vars([-1, 1], np.int32)
+        outputs = self._make_scalar_vars([0], np.int32)
+        self.checkScript(script, inputs, outputs[0], True, 'test_if_noelse')
 
     def test_script_while_nonexistant_value(self):
         with self.assertRaisesRegex(RuntimeError, "undefined value x"):
-            cu = torch.jit._jit_script_compile('''
-            def test_while(a, b) -> (c):
+            torch.jit.CompilationUnit('''
+            def test_while(a, b):
                 while a < 10:
                     a = a + x
                     b = b + 1
-                c = a + b
+                return a + b
             ''')
 
     def test_script_while_nonexistant_cond_value(self):
         with self.assertRaisesRegex(RuntimeError, "undefined value x"):
-            cu = torch.jit._jit_script_compile('''
-            def test_while(a, b) -> (c):
+            torch.jit.CompilationUnit('''
+            def test_while(a, b):
                 while a < x:
                     a = a + 1
                     b = b + 1
-                c = a + b
+                return a + b
             ''')
 
     def test_script_while_write_outer_then_read(self):
-        cu = torch.jit._jit_script_compile('''
-        def test_while(a, b) -> (c):
+        script = '''
+        def test_while(a, b):
             while a < 10:
                 a = a + 1
                 b = a + 1
-            c = a + b
-        ''')
-        self.assertExpected(str(cu.get_graph('test_while')))
+            return a + b
+        '''
+        inputs = self._make_scalar_vars([42, 1337], np.int32)
+        outputs = self._make_scalar_vars([1379], np.int32)
+        self.checkScript(script, inputs, outputs[0], True, 'test_while')
 
     def test_script_while_nest_if(self):
-        cu = torch.jit._jit_script_compile('''
-        def test_while_if(a, b) -> (c):
+        script = '''
+        def test_while_if(a, b):
             c = 0
             while a < 10:
                 a = a + 1
@@ -1500,39 +1573,361 @@ class TestJit(TestCase):
                     c = -a
                 else:
                     c = -b
-            c = c + 1
-        ''')
-        self.assertExpected(str(cu.get_graph('test_while_if')))
+            return c + 1
+        '''
+        inputs = self._make_scalar_vars([-1234, 4321], np.int32)
+        outputs = self._make_scalar_vars([-5564], np.int32)
+        self.checkScript(script, inputs, outputs[0], False, 'test_while_if')
 
     def test_script_if_nest_while(self):
-        cu = torch.jit._jit_script_compile('''
-        def test_if_while(a, b) -> (c):
+        script = '''
+        def test_if_while(a, b):
             c = 0
             if a > b:
                 while a > b:
                     b = b + 1
                     c = -b
-        ''')
-        self.assertExpected(str(cu.get_graph('test_if_while')))
+            return c
+        '''
+        inputs = self._make_scalar_vars([4321, 1234], np.int32)
+        outputs = self._make_scalar_vars([-4321], np.int32)
+        self.checkScript(script, inputs, outputs[0], True, 'test_if_while')
 
     def test_script_ternary(self):
-        cu = torch.jit._jit_script_compile('''
-        def test_ternary_control(a, b) -> (c):
+        cu = torch.jit.CompilationUnit('''
+        def test_ternary_control(a, b):
             c = 3
             if a > 3:
                 c = a + b
             else:
                 c = b
+            return c
         ''')
-        cu2 = torch.jit._jit_script_compile('''
-        def test_ternary(a, b) -> (c):
+        cu2 = torch.jit.CompilationUnit('''
+        def test_ternary(a, b):
             c = 3
             c = a + b if a > 3 else b
+            return c
         ''')
         self.assertEqual(
-            str(cu.get_graph('test_ternary_control')),
-            str(cu2.get_graph('test_ternary')),
+            str(cu.test_ternary_control.graph()),
+            str(cu2.test_ternary.graph()),
         )
+
+    def test_python_frontend_run(self):
+        def func(x, y):
+            q = (x + y).sigmoid()
+            print(q)
+            w = -q
+            return w * w
+
+        x = Variable(torch.arange(4), requires_grad=True)
+        y = Variable(torch.arange(4) * 2, requires_grad=True)
+
+        expected_out = (x + y).sigmoid().pow(2)
+
+        self.checkScript(func, [x, y], expected_out, False, capture_output=True)
+
+    def test_trace_annotation(self):
+        @torch.jit.trace(Variable(torch.rand(1)))
+        def foo(a):
+            return a + a + a
+        s = Variable(torch.rand(2))
+        self.assertEqual(s + s + s, foo(s))
+
+    def test_script_cu(self):
+        cu = torch.jit.CompilationUnit('''
+            def foo(a):
+                b = a
+                return b
+        ''')
+        a = Variable(torch.rand(1))
+        self.assertEqual(a, cu.foo(a))
+
+    def test_script_annotation(self):
+        @torch.jit.script
+        def foo(a):
+            return a + a + a
+        s = Variable(torch.rand(2))
+        self.assertEqual(s + s + s, foo(s))
+
+    def test_script_error(self):
+        @torch.jit.script
+        def foo(a):
+            return a.t()
+        s = Variable(torch.rand(10))
+        # XXX: this should stay quiet in stay propagation and only fail in the interpreter
+        with self.assertRaisesRegex(RuntimeError, "failed in interpreter"):
+            foo(s)
+
+        @torch.jit.script
+        def bar(c, b):
+            return c / b
+
+        with self.assertRaisesRegex(RuntimeError, "failed in interpreter"):
+            bar(Variable(torch.rand(10), requires_grad=True), Variable(torch.rand(9), requires_grad=True))
+
+    def test_script_python_call(self):
+        def pyfunc(a):
+            return a * 3.0
+
+        cu = torch.jit.CompilationUnit('''
+        def other_func(a):
+            return a + a
+
+        def test_call_python(a):
+            b = pyfunc(a)
+            b = other_func(b)
+            i = 0
+            step = 1
+            while i < 10:
+                b = pyfunc(b)
+                if b > 3.0:
+                    b = pyfunc(b)
+                i = 11
+            return b
+        ''')
+        inputs = self._make_scalar_vars([1], np.float32)
+        outputs = self._make_scalar_vars([54], np.float32)
+
+        self.assertEqual(cu.test_call_python(*inputs), outputs[0])
+
+    def test_script_python_call_failure(self):
+        with self.assertRaisesRegex(RuntimeError, "undefined value pyfunc2"):
+            def pyfunc(a):
+                return a * 3.0
+
+            cu = torch.jit.CompilationUnit('''
+            def other_func(a):
+                return a + a
+
+            def test_call_python(a):
+                b = pyfunc(a)
+                b = other_func(b)
+                i = 0
+                step = 1
+                while i < 10:
+                    b = pyfunc2(b)
+                    if b > 3.0:
+                        b = pyfunc(b)
+                    i = 11
+                return b
+            ''')
+            inputs = self._make_scalar_vars([1], np.float32)
+            outputs = self._make_scalar_vars([54], np.float32)
+
+            self.assertEqual(cu.test_call_python(*inputs), outputs)
+
+    def test_script_python_call_annotation(self):
+        def pyfunc(a):
+            return a * 3.0
+
+        @torch.jit.script
+        def foo(a):
+            # return self.test(a)
+            return pyfunc(a) + pyfunc(a)
+
+        inputs = self._make_scalar_vars([1], np.float32)
+        outputs = self._make_scalar_vars([6], np.float32)
+
+        self.assertEqual(foo(*inputs), outputs[0])
+
+    def test_script_python_call_annotation_failure(self):
+        with self.assertRaisesRegex(RuntimeError, "undefined value pyfunc2"):
+            def pyfunc(a):
+                return a * 3.0
+
+            @torch.jit.script
+            def foo(a):
+                # return self.test(a)
+                return pyfunc2(a) + pyfunc(a)
+
+            inputs = self._make_scalar_vars([1], np.float32)
+            outputs = self._make_scalar_vars([6], np.float32)
+
+            self.assertEqual(foo(*inputs), outputs)
+
+    @unittest.skipIf(IS_WINDOWS, "NYI: fuser support for Windows")
+    @unittest.skipIf(not RUN_CUDA, "calls .cuda()")
+    def test_traced_module(self):
+        class Model(nn.Module):
+            def __init__(self, num_features, num_layers):
+                super(Model, self).__init__()
+                self.num_layers = num_layers
+                layers = [[nn.Linear(num_features, num_features), nn.Sigmoid()]
+                          for _ in range(num_layers)]
+                self.submodule = nn.Sequential(*chain(*layers))
+
+            def forward(self, x):
+                for i in range(self.num_layers):
+                    x = self.submodule[i](x) + x
+                return x
+
+        model = Model(5, 3)
+        x = torch.randn(2, 5)
+        traced_model = torch.jit.trace(x)(model)
+
+        # We're missing some attributes these modules had initially. Make sure we can
+        # still get the __repr__()
+        model.__repr__()
+
+        # XXX: indexing sequentials is broken
+        linear_submodule = next(iter(traced_model.submodule._modules.values()))
+
+        # All attributes that aren't parameters should raise
+        with self.assertRaises(AttributeError):
+            linear_submodule.in_features
+        linear_submodule.weight
+        with self.assertRaises(RuntimeError):
+            traced_model.asdf = 4
+        linear_submodule.weight = nn.Parameter(torch.randn(linear_submodule.weight.shape))
+        with self.assertRaises(RuntimeError):
+            del linear_submodule.weight
+
+        # Submodules can't be called
+        with self.assertRaises(RuntimeError):
+            linear_submodule(x)
+
+        # Type casts
+        with self.assertRaises(RuntimeError):
+            linear_submodule.cuda()
+        traced_model.float().cuda()
+        cuda_out = traced_model(x.float().cuda())
+        traced_model.cpu()
+        cpu_out = traced_model(x.float())
+        self.assertEqual(cpu_out, cuda_out)
+        traced_model.double()
+
+        # state_dict + load_state_dict
+        state = {k: v.clone() for k, v in traced_model.state_dict().items()}
+        new_state = {k: v.clone().fill_(1) for k, v in state.items()}
+        out = traced_model(x)
+        traced_model.load_state_dict(new_state)
+        out_ones = traced_model(x)
+        traced_model.load_state_dict(state)
+        out_state = traced_model(x)
+        self.assertEqual(out, out_state)
+        self.assertNotEqual(out, out_ones)
+
+    def test_shape_prop_mismatch_output(self):
+        with self.assertRaises(RuntimeError):
+            cu = torch.jit.CompilationUnit('''
+            def test_shape_prop_mismatch_output(a):
+                b = slice(a, dim=0, end=-2, start=2, step=1)
+                b = topk(a, dim=0, k=2, largest=True, sorted=True)
+                return b
+            ''')
+            inputs = [torch.zeros(10)]
+            outputs = [torch.zeros(2), torch.from_numpy(np.array([1, 5])).long()]
+
+            real_outs = cu.test_shape_prop_mismatch_output(*inputs)
+            self.assertEqual(real_outs, outputs)
+
+    def test_view_shape_prop(self):
+        cu = torch.jit.CompilationUnit('''
+        def test_view_shape_prop(a):
+            return view(a, size=[-1])
+        ''')
+        inputs = [torch.zeros(10, 10)]
+        outputs = torch.zeros(100)
+
+        real_outs = cu.test_view_shape_prop(*inputs)
+        self.assertEqual(real_outs, outputs)
+
+    def test_integral_shape_inference(self):
+        cu = torch.jit.CompilationUnit('''
+        def test_integral_shape_inference(a):
+            return a / a
+        ''')
+        inputs = [torch.ones(10, 10).type(torch.LongTensor)]
+        outputs = torch.ones(10, 10)
+
+        self.assertEqual(cu.test_integral_shape_inference(*inputs), outputs)
+
+    def test_fuser_multiple_blocks(self):
+        cu = torch.jit.CompilationUnit('''
+        def test_fuser_multiple_blocks(this, that, theother, meme):
+            i = 0LL
+            while i < 20LL:
+                this = cat(this, meme, dim=0)
+                that = cat(that, meme, dim=0)
+                theother = cat(theother, meme, dim=0)
+                i = i + 1
+            return this, that, theother
+        ''')
+
+        inputs = [torch.ones(0, 10, 10)] * 3
+        inputs += [torch.ones(1, 10, 10)]
+        outputs = [torch.ones(20, 10, 10)] * 3
+
+        self.assertEqual(cu.test_fuser_multiple_blocks(*inputs), outputs)
+
+    def test_print_graph_executor(self):
+        cu = torch.jit.CompilationUnit('''
+        def test_print_graph_executor(meme):
+            print(meme)
+            return meme
+        ''')
+
+        inputs = [torch.ones(5, 5)]
+
+        with capture_stdout() as captured:
+            cu.test_print_graph_executor(*inputs)
+
+        if not WINDOWS:
+            self.assertExpected(captured[0])
+
+    def test_script_module(self):
+        class M1(torch.jit.ScriptModule):
+            def __init__(self):
+                super(M1, self).__init__(False)
+                self.weight = nn.Parameter(torch.randn(2))
+
+            @torch.jit.script_method
+            def forward(self, thing):
+                return self.weight + thing
+
+        class M2(torch.jit.ScriptModule):
+            def __init__(self):
+                super(M2, self).__init__(False)
+                # test submodule
+                self.sub = M1()
+                # test parameters
+                self.weight = nn.Parameter(torch.randn(2, 3))
+                self.bias = nn.Parameter(torch.randn(2))
+                # test defining a method from a string
+                self.define("""
+                    def hi(self, a):
+                        return self.weight.mm(a)
+                """)
+            # test script methods
+
+            @torch.jit.script_method
+            def doit(self, input):
+                # test use of parameter
+                return self.weight.mm(input)
+
+            @torch.jit.script_method
+            def doit2(self, input):
+                return self.weight.mm(input)
+
+            @torch.jit.script_method
+            def forward(self, input):
+                a = self.doit(input)
+                b = self.doit2(input)
+                c = self.hi(input)
+                return a + b + self.bias + self.sub(a) + c
+        m2 = M2()
+        input = torch.randn(3, 2)
+        a = m2.weight.mm(input)
+        b = m2.weight.mm(input)
+        c = m2.weight.mm(input)
+        ref = a + b + m2.bias + m2.sub.weight + a + c
+        self.assertEqual(ref, m2.forward(input))
+        m2.weight = nn.Parameter(torch.zeros_like(m2.weight))
+        m2.bias = nn.Parameter(torch.zeros_like(m2.bias))
+        m2.sub.weight = nn.Parameter(torch.zeros_like(m2.sub.weight))
+        self.assertEqual(torch.zeros(2, 2), m2.forward(torch.randn(3, 2)))
 
 if __name__ == '__main__':
     run_tests()

@@ -73,8 +73,7 @@ static std::vector<Value*> gradientForNode(Node* node, ArrayRef<Value*> grad_val
         return {grads.at(0).squeeze(node->i(kdim))};
       case kmm: {
         SymbolicVariable dmat1, dmat2;
-        if (inputs.at(0).value()->hasType()) {
-          auto type = inputs.at(0).value()->type()->expect<TensorType>();
+        if (auto type = inputs.at(0).value()->type()->cast<TensorType>()) {
           auto sizes = type->sizes(), strides = type->strides();
           if (strides.at(0) == 1 && strides.at(1) == sizes.at(0)) {
             dmat1 = inputs.at(1).mm(grads.at(0).t()).t();
@@ -84,8 +83,7 @@ static std::vector<Value*> gradientForNode(Node* node, ArrayRef<Value*> grad_val
         } else {
           dmat1 = grads.at(0).mm(inputs.at(1).t());
         }
-        if (inputs.at(1).value()->hasType()) {
-          auto type = inputs.at(1).value()->type()->expect<TensorType>();
+        if (auto type = inputs.at(1).value()->type()->cast<TensorType>()) {
           auto sizes = type->sizes(), strides = type->strides();
           if (strides.at(0) == 1 && strides.at(1) == sizes.at(0)) {
             dmat2 = grads.at(0).t().mm(inputs.at(0)).t();
@@ -156,13 +154,13 @@ static std::vector<Value*> gradientForNode(Node* node, ArrayRef<Value*> grad_val
     throw std::runtime_error(std::string("don't support differentiation of `") +
                             node->kind().toString() + "`");
   };
-  const auto has_type = [](Value *v) { return v->hasType(); };
+  const auto has_tensor_type = [](Value *v) { return v->isTensor(); };
   if (!isDifferentiable(node)) {
     throw std::runtime_error(std::string("differentiation of ") + node->kind().toString() + " "
                              "is not supported, or it is missing necessary type information");
   }
-  if (!std::all_of(node->inputs().begin(), node->inputs().end(), has_type) ||
-      !std::all_of(node->outputs().begin(), node->outputs().end(), has_type)) {
+  if (!std::all_of(node->inputs().begin(), node->inputs().end(), has_tensor_type) ||
+      !std::all_of(node->outputs().begin(), node->outputs().end(), has_tensor_type)) {
     throw std::runtime_error("differentiate should be called with a graph where every value "
                              "has a type registered");
 
@@ -194,13 +192,13 @@ static value_set findAllRequiresGradNodes(
 }
 
 static Value* createZerosLike(Value *v) {
-  JIT_EXPECTM(v->hasType(), "can't allocate zero gradient for a value without a type");
+  JIT_EXPECTM(v->isTensor(), "can't allocate zero gradient for a value without a type");
   Graph *graph = v->owningGraph();
   auto type = v->type()->expect<TensorType>();
   AutoGPU gpu_guard(type->device());
 
   auto & at_type = type->device() == -1 ? at::CPU(type->scalarType()) : at::CUDA(type->scalarType());
-  auto zeros = at_type.zeros({1}).expand(type->sizes());
+  auto zeros = at::zeros(at_type, {1}).expand(type->sizes());
   Node *constant = graph->createConstant(zeros)
                         ->i_(kis_zero, 1);
   graph->insertNode(constant);
@@ -244,9 +242,9 @@ static ReverseDetails addReverseInline(Gradient& grad_desc,
   // note: reverse_node is intentionally not inserted to avoid
   // accidentally acting on it (e.g. in elminate dead code),
   // std::cout << *reverse_node << to view its state.
-  auto reverse_node = graph.create("Reverse"_sym, 0);
+  auto reverse_node = graph.create(kReverse, 0);
   auto reverse_block = reverse_node->addBlock();
-  WithInsertPoint guard(graph, reverse_block);
+  WithInsertPoint guard(reverse_block);
 
   auto requires_grad_set = findAllRequiresGradNodes(graph, input_requires_grad);
   const auto requires_grad = [&](Value *v) { return requires_grad_set.count(v) > 0; };
@@ -272,7 +270,7 @@ static ReverseDetails addReverseInline(Gradient& grad_desc,
     Value * output = outputs[i];
     if (!requires_grad(output))
       continue;
-    Value * output_grad = reverse_block->addInput()->setType(output->typeOption());
+    Value * output_grad = reverse_block->addInput()->setType(output->type());
     output_grad = createUndefGuard(output_grad, createZerosLike(output));
     set_grad(output, output_grad);
     grad_desc.df_input_vjps.push_back(i);
@@ -432,10 +430,10 @@ static void lambdaLiftReverse(Gradient& grad_desc, ReverseDetails& rev_info) {
     Value * tmp = graph.outputs().at(i);
     // Add VJP inputs only for intermediates that actually required grad.
     if (rev_info.requires_grad_set.count(tmp) == 0) continue;
-    Value * tmp_vjp_in = reverse_block->addInput()->setType(tmp->typeOption());
+    Value * tmp_vjp_in = reverse_block->addInput()->setType(tmp->type());
     Value * tmp_vjp_prev = rev_info.grad_map.at(tmp);
     {
-      WithInsertPoint guard(graph, tmp_vjp_prev->node());
+      WithInsertPoint guard(tmp_vjp_prev->node());
       auto zeroes = createZerosLike(tmp);
       tmp_vjp_in = createUndefGuard(tmp_vjp_in, zeroes);
     }
@@ -481,7 +479,7 @@ Gradient differentiate(std::shared_ptr<Graph>& _graph, const std::vector<bool>& 
   std::swap(_graph, grad_desc.f);
   // XXX: Take care when handling outputs - they can be duplicated!
 
-  WithInsertPoint guard(*grad_desc.f, grad_desc.f->block());
+  WithInsertPoint guard(grad_desc.f->block());
   // Fills in df_input_vjps and df_output_vjps
   auto rev_info = addReverseInline(grad_desc, requires_grad);
   // addReverseInline has to call gradientForNode if *any* of the outputs

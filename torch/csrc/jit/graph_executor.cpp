@@ -1,4 +1,3 @@
-#include "Python.h"
 #include "torch/csrc/jit/graph_executor.h"
 #include "torch/csrc/jit/ir.h"
 #include "torch/csrc/jit/argument_spec.h"
@@ -64,20 +63,22 @@ private:
 // It can optionally also have a gradient which is hooked up
 // to the output Variables if present.
 struct ExecutionPlan {
-  ExecutionPlan(std::shared_ptr<Graph> & graph)
-  : f(graph) {}
-  ExecutionPlan(std::shared_ptr<Graph> & graph, Gradient grad)
-  : f(graph), grad(std::move(grad)), grad_executor(this->grad.df) {}
+  ExecutionPlan(std::shared_ptr<Graph>& graph)
+      : f(graph, /*values_are_variables=*/false) {}
+  ExecutionPlan(std::shared_ptr<Graph>& graph, Gradient grad)
+      : f(graph, /*values_are_variables=*/false),
+        grad(std::move(grad)),
+        grad_executor(this->grad.df) {}
 
-  variable_tensor_list run(variable_tensor_list inputs) const {
+  variable_tensor_list run(variable_tensor_list&& inputs) const {
     if(grad) {
       return runWithGrad(std::move(inputs));
     }
     // TODO: interpreter needs to accept moved inputs
     // and delete incrementally
-    tensor_list outputs;
-    InterpreterState(f).runOneStage(unwrapVariables(std::move(inputs)), outputs);
-    return wrapTensors(std::move(outputs));
+    auto stack = unwrapVariables(std::move(inputs));
+    InterpreterState(f).runOneStage(stack);
+    return wrapTensors(std::move(stack));
   }
 private:
   // inplace to avoid allocations
@@ -117,9 +118,9 @@ private:
     }
     captureInputs(*grad_fn, inputs);
 
-    tensor_list outputs_;
-    InterpreterState(f).runOneStage(unwrapVariables(std::move(inputs)), outputs_);
-    variable_tensor_list outputs = wrapTensors(std::move(outputs_));
+    auto stack = unwrapVariables(std::move(inputs));
+    InterpreterState(f).runOneStage(stack);
+    variable_tensor_list outputs = wrapTensors(std::move(stack));
 
     // hookup the gradients for the output tensors that require gradients
     // to the inputs to our gradient function df
@@ -173,10 +174,10 @@ struct GraphExecutorImpl {
     if(!optimize || (!symbolically_differentiable && needsGradient(inputs))) {
       auto & fb = getOrCreateAutogradFallback();
       InterpreterState state(fb);
-      tensor_list outputs;
-      state.runOneStage(std::move(inputs), outputs);
+      auto stack = std::move(inputs);
+      state.runOneStage(stack);
       // note: we never unwrapped inputs, because we want autograd to record the trace
-      return variable_tensor_list(std::move(outputs));
+      return stack;
     }
 
     // either we can symbolically differentiate, or we do not need a gradient.
@@ -232,7 +233,7 @@ private:
       CreateAutodiffSubgraphs(*graph_);
       runOptimization(graph_, /*graphMustSupportVariables=*/true);
     }
-    autograd_fallback = Code(graph_);
+    autograd_fallback = Code(graph_, /*values_are_variables=*/true);
     return autograd_fallback;
   }
   const ExecutionPlan & getOrCompile(const variable_tensor_list & inputs) {
