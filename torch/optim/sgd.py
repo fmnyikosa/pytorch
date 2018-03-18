@@ -109,6 +109,7 @@ class SGD(Optimizer):
             closure (callable, optional): A closure that reevaluates the model
                 and returns the loss.
         """
+
         loss = None
         if closure is not None:
             loss = closure()
@@ -138,6 +139,9 @@ class SGD(Optimizer):
                     else:
                         d_p = buf
 
-                p.data.add_( - lr , d_p )
+                group['lr'] = lr
+                # print torch.typename(group['lr'])
+                # print torch.typename(d_p)
+                p.data.add_( -group['lr'], d_p )
 
         return loss

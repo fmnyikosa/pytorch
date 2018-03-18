@@ -111,6 +111,7 @@ class Adam(Optimizer):
             closure (callable, optional): A closure that reevaluates the model
                 and returns the loss.
         """
+
         loss = None
         if closure is not None:
             loss = closure()
@@ -158,9 +159,11 @@ class Adam(Optimizer):
                 else:
                     denom = exp_avg_sq.sqrt().add_(group['eps'])
 
+                group['lr'] = lr
+
                 bias_correction1 = 1 - beta1 ** state['step']
                 bias_correction2 = 1 - beta2 ** state['step']
-                step_size        = lr * math.sqrt(bias_correction2) / bias_correction1
+                step_size        = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
 
